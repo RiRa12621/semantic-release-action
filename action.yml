@@ -1,0 +1,111 @@
+name: 'Simple Semantic Release'
+description: 'Automated semantic versioning, tagging, releasing, and artifact uploading.'
+author: 'Rick Rackow'
+branding:
+  icon: 'tag'
+  color: 'blue'
+
+inputs:
+  github_token:
+    description: 'GITHUB_TOKEN for creating releases'
+    required: true
+  artifacts:
+    description: 'Path or glob of artifacts to upload (e.g. *.dmg)'
+    required: false
+    default: ''
+  dry_run:
+    description: 'If true, calculates version but does not tag/release. Useful for getting the version number for build steps.'
+    required: false
+    default: 'false'
+
+outputs:
+  version:
+    description: 'The calculated next version (e.g. v1.0.5)'
+    value: ${{ steps.calc.outputs.version }}
+  upload_url:
+    description: 'The URL for uploading assets to the release'
+    value: ${{ steps.create_release.outputs.upload_url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Git
+      shell: bash
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        # Ensure tags are present
+        git fetch --tags --force
+
+    - name: Calculate Version
+      id: calc
+      shell: bash
+      run: |
+        # Get latest tag or default
+        TAG=$(git tag | sort -uV | tail -n 1)
+        if [[ -z "$TAG" ]]; then TAG="v0.0.0"; fi
+        
+        # Get logs since last tag
+        if [[ "$TAG" == "v0.0.0" ]]; then
+          LOG=$(git log --pretty=format:"- %s")
+        else
+          LOG=$(git log "$TAG..HEAD" --pretty=format:"- %s")
+        fi
+        
+        # Analyze commit messages
+        BREAK=$(echo "$LOG" | grep -i "!" || true)
+        FEAT=$(echo "$LOG" | grep -i "^- feat" || true)
+        FIX=$(echo "$LOG" | grep -i "^- fix" || true)
+        
+        # Parse version
+        VERSION=${TAG#v}
+        IFS='.' read -r major minor patch <<< "$VERSION"
+        
+        if [[ -n "$BREAK" ]]; then
+          major=$((major+1)); minor=0; patch=0
+        elif [[ -n "$FEAT" ]]; then
+          minor=$((minor+1)); patch=0
+        elif [[ -n "$FIX" ]]; then
+          patch=$((patch+1))
+        fi
+        
+        NEW_VERSION="v$major.$minor.$patch"
+        echo "Calculated version: $NEW_VERSION"
+        
+        # Set Output
+        echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        
+        # Generate Changelog (Multiline safe)
+        EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+        echo "changelog<<$EOF" >> $GITHUB_OUTPUT
+        echo "## Changes in $NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "$LOG" >> $GITHUB_OUTPUT
+        echo "$EOF" >> $GITHUB_OUTPUT
+
+    - name: Create Release
+      id: create_release
+      if: inputs.dry_run == 'false'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        NEW_VER: ${{ steps.calc.outputs.version }}
+        NOTES: ${{ steps.calc.outputs.changelog }}
+        ARTIFACTS: ${{ inputs.artifacts }}
+      run: |
+        # Check if tag already exists (idempotency)
+        if git rev-parse "$NEW_VER" >/dev/null 2>&1; then
+          echo "Tag $NEW_VER already exists. Skipping release creation."
+          exit 0
+        fi
+
+        echo "Tagging $NEW_VER..."
+        git tag "$NEW_VER"
+        git push origin "$NEW_VER"
+        
+        echo "Creating GitHub Release..."
+        # Create release. If artifacts are provided, add them.
+        if [[ -n "$ARTIFACTS" ]]; then
+           gh release create "$NEW_VER" $ARTIFACTS --title "$NEW_VER" --notes "$NOTES"
+        else
+           gh release create "$NEW_VER" --title "$NEW_VER" --notes "$NOTES"
+        fi
